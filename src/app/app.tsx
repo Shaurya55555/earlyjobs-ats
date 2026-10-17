@@ -1,98 +1,167 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { STAGES, canMove, parseSkills, type Candidate, type Stage } from "@/lib/ats";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { canMove, type Candidate, type Job, type Stage } from "@/lib/ats";
+import { api } from "@/lib/client";
+import CandidateForm from "@/components/CandidateForm";
+import CandidatesTable, { EMPTY_FILTERS, type Filters } from "@/components/CandidatesTable";
+import Dashboard, { type Metrics } from "@/components/Dashboard";
+import Detail from "@/components/Detail";
+import ImportDialog from "@/components/ImportDialog";
+import Jobs from "@/components/Jobs";
+import Pipeline from "@/components/Pipeline";
+import { Skeleton, btnPrimary } from "@/components/ui";
 
-type Metrics = {
-  total: number; newThisWeek: number; avgExperience: number; active: number; hireRate: number | null;
-  byStage: Record<string, number>; funnel: { stage: string; reached: number }[];
-  bySource: { source: string; n: number }[]; byRole: { role: string; n: number }[];
-};
-type History = { from_stage: string | null; to_stage: string; changed_at: string };
-type Tab = "dashboard" | "pipeline" | "candidates";
+type Tab = "dashboard" | "pipeline" | "candidates" | "jobs";
+const TABS: Tab[] = ["dashboard", "pipeline", "candidates", "jobs"];
+type Toast = { msg: string; undo?: () => void };
+const UNDO_MS = 4000;
 
-const STAGE_COLOR: Record<Stage, string> = {
-  Applied: "bg-slate-100 text-slate-700 border-slate-300",
-  Screening: "bg-sky-100 text-sky-800 border-sky-300",
-  Interview: "bg-violet-100 text-violet-800 border-violet-300",
-  Offer: "bg-amber-100 text-amber-800 border-amber-300",
-  Hired: "bg-emerald-100 text-emerald-800 border-emerald-300",
-  Rejected: "bg-rose-100 text-rose-800 border-rose-300",
-};
-
-const fmt = (d: string) => new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
-
-async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, { ...init, headers: { "Content-Type": "application/json" } });
-  const body = await res.json();
-  if (!res.ok) throw Object.assign(new Error(body.error ?? "Request failed"), { fields: body.fields as Record<string, string[]> | undefined });
-  return body;
-}
-
-function StageBadge({ stage }: { stage: Stage }) {
-  return <span className={`inline-block rounded-full border px-2 py-0.5 text-xs font-medium ${STAGE_COLOR[stage]}`}>{stage}</span>;
+function readUrl() {
+  const p = new URLSearchParams(window.location.search);
+  const tab = (TABS as string[]).includes(p.get("tab") ?? "") ? (p.get("tab") as Tab) : "dashboard";
+  const filters: Filters = {
+    q: p.get("q") ?? "", stage: p.get("stage") ?? "", source: p.get("source") ?? "", min_rating: p.get("min_rating") ?? "",
+    sort: p.get("sort") ?? "newest", skill: p.get("skill") ?? "", stale: p.get("stale") === "1", interviews: p.get("interviews") === "1",
+    page: Math.max(1, Number(p.get("page")) || 1),
+  };
+  return { tab, job: p.get("job") ?? "", filters };
 }
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
-  const [all, setAll] = useState<Candidate[]>([]);
+  const [jobId, setJobId] = useState("");
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [hydrated, setHydrated] = useState(false);
+
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [board, setBoard] = useState<Candidate[]>([]);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [toast, setToast] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+
+  const [detailId, setDetailId] = useState<number | null>(null);
   const [editing, setEditing] = useState<Candidate | "new" | null>(null);
-  const [detail, setDetail] = useState<Candidate | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const pending = useRef(new Map<number, { timer: ReturnType<typeof setTimeout>; to: Stage; from: Stage }>());
 
-  // list filters
-  const [q, setQ] = useState("");
-  const [stage, setStage] = useState("");
-  const [role, setRole] = useState("");
-  const [sort, setSort] = useState("newest");
-  const [shown, setShown] = useState<Candidate[]>([]);
+  const flash = useCallback((msg: string, undo?: () => void, ms = 3200) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ msg, undo });
+    toastTimer.current = setTimeout(() => setToast(null), ms);
+  }, []);
 
-  const flash = (m: string) => { setToast(m); setTimeout(() => setToast(null), 2800); };
+  // URL <-> state, so any view or filtered list can be shared or reloaded.
+  useEffect(() => {
+    const u = readUrl();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time hydration from the URL; window is unavailable during SSR
+    setTab(u.tab); setJobId(u.job); setFilters(u.filters); setHydrated(true);
+  }, []);
+  useEffect(() => {
+    if (!hydrated) return;
+    const p = new URLSearchParams();
+    if (tab !== "dashboard") p.set("tab", tab);
+    if (jobId) p.set("job", jobId);
+    if (tab === "candidates") {
+      if (filters.q) p.set("q", filters.q);
+      if (filters.stage) p.set("stage", filters.stage);
+      if (filters.source) p.set("source", filters.source);
+      if (filters.min_rating) p.set("min_rating", filters.min_rating);
+      if (filters.skill) p.set("skill", filters.skill);
+      if (filters.stale) p.set("stale", "1");
+      if (filters.interviews) p.set("interviews", "1");
+      if (filters.sort !== "newest") p.set("sort", filters.sort);
+      if (filters.page > 1) p.set("page", String(filters.page));
+    }
+    const qs = p.toString();
+    window.history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+  }, [hydrated, tab, jobId, filters]);
 
   const refresh = useCallback(async () => {
-    const [c, m] = await Promise.all([api<{ candidates: Candidate[] }>("/api/candidates"), api<Metrics>("/api/metrics")]);
-    setAll(c.candidates); setMetrics(m); setLoading(false);
-  }, []);
-  useEffect(() => { refresh().catch(() => setLoading(false)); }, [refresh]);
-
-  // server-side search/filter, debounced
-  useEffect(() => {
-    const t = setTimeout(async () => {
-      const p = new URLSearchParams();
-      if (q.trim()) p.set("q", q.trim());
-      if (stage) p.set("stage", stage);
-      if (role) p.set("role", role);
-      p.set("sort", sort);
-      const r = await api<{ candidates: Candidate[] }>(`/api/candidates?${p}`);
-      setShown(r.candidates);
-    }, 200);
-    return () => clearTimeout(t);
-  }, [q, stage, role, sort, all]);
-
-  const roles = useMemo(() => Array.from(new Set(all.map((c) => c.role))).sort(), [all]);
-
-  async function move(c: Candidate, to: Stage) {
-    if (!canMove(c.stage, to)) return;
-    const prev = all;
-    setAll(all.map((x) => (x.id === c.id ? { ...x, stage: to } : x))); // optimistic
+    const jq = jobId ? `job_id=${jobId}` : "";
     try {
-      await api(`/api/candidates/${c.id}`, { method: "PATCH", body: JSON.stringify({ stage: to }) });
-      flash(`${c.name} moved to ${to}`);
-      refresh();
-      setDetail((d) => (d && d.id === c.id ? { ...d, stage: to } : d));
-    } catch (e) {
-      setAll(prev);
-      flash((e as Error).message);
+      const [b, m, j] = await Promise.all([
+        api<{ candidates: Candidate[] }>(`/api/candidates?pageSize=500&sort=newest&${jq}`),
+        api<Metrics>(`/api/metrics?${jq}`),
+        api<{ jobs: Job[] }>("/api/jobs"),
+      ]);
+      setBoard(b.candidates); setMetrics(m); setJobs(j.jobs); setLoadError(false);
+    } catch { setLoadError(true); }
+    setLoaded(true);
+    setVersion((v) => v + 1);
+  }, [jobId]);
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch on mount and when the job filter changes
+  useEffect(() => { if (hydrated) refresh(); }, [hydrated, refresh]);
+
+  // --- stage moves: board and dropdown moves are optimistic and undoable for a few seconds ---
+  const commit = useCallback(async (id: number) => {
+    const p = pending.current.get(id);
+    if (!p) return;
+    clearTimeout(p.timer);
+    pending.current.delete(id);
+    try { await api(`/api/candidates/${id}`, { method: "PATCH", body: JSON.stringify({ stage: p.to }) }); }
+    catch (e) { flash((e as Error).message); }
+    refresh();
+  }, [flash, refresh]);
+
+  const move = useCallback((c: Candidate, to: Stage, opts?: { immediate?: boolean }) => {
+    const existing = pending.current.get(c.id);
+    const from = existing?.from ?? c.stage;
+    if (existing) { clearTimeout(existing.timer); pending.current.delete(c.id); }
+    if (!canMove(from, to)) return;
+    setBoard((b) => b.map((x) => (x.id === c.id ? { ...x, stage: to, stage_changed_at: new Date().toISOString() } : x)));
+    if (opts?.immediate) {
+      pending.current.set(c.id, { timer: setTimeout(() => {}, 0), to, from });
+      commit(c.id).then(() => flash(`${c.name} moved to ${to}`));
+      return;
     }
-  }
+    const timer = setTimeout(() => commit(c.id), UNDO_MS);
+    pending.current.set(c.id, { timer, to, from });
+    flash(`${c.name} moved to ${to}`, () => {
+      clearTimeout(timer);
+      pending.current.delete(c.id);
+      setBoard((b) => b.map((x) => (x.id === c.id ? { ...x, stage: from, stage_changed_at: c.stage_changed_at } : x)));
+      setToast(null);
+    }, UNDO_MS);
+  }, [commit, flash]);
+
+  // Don't lose a move if the tab closes inside the undo window.
+  useEffect(() => {
+    const h = () => {
+      for (const [id, p] of pending.current) {
+        fetch(`/api/candidates/${id}`, { method: "PATCH", keepalive: true, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage: p.to }) });
+      }
+    };
+    window.addEventListener("pagehide", h);
+    return () => window.removeEventListener("pagehide", h);
+  }, []);
 
   async function remove(c: Candidate) {
     if (!window.confirm(`Delete ${c.name}? This cannot be undone.`)) return;
     await api(`/api/candidates/${c.id}`, { method: "DELETE" });
-    setDetail(null); flash("Candidate deleted"); refresh();
+    setDetailId(null); flash("Candidate deleted"); refresh();
   }
+
+  // Keyboard shortcuts: / search, n new, 1-4 switch tabs.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      if (e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable) return;
+      if (editing || importing || detailId !== null) return;
+      if (e.key === "/") { e.preventDefault(); setTab("candidates"); setTimeout(() => searchRef.current?.focus(), 50); }
+      else if (e.key === "n") { e.preventDefault(); setEditing("new"); }
+      else if ("1234".includes(e.key) && e.key) setTab(TABS[Number(e.key) - 1]);
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [editing, importing, detailId]);
+
+  const showStale = () => { setFilters({ ...EMPTY_FILTERS, stale: true, sort: "stale" }); setTab("candidates"); };
+  const showInterviews = () => { setFilters({ ...EMPTY_FILTERS, interviews: true }); setTab("candidates"); };
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6">
@@ -101,283 +170,62 @@ export default function App() {
           <h1 className="text-2xl font-bold tracking-tight">Mini ATS</h1>
           <p className="text-sm text-slate-500">Track candidates from application to offer.</p>
         </div>
-        <button onClick={() => setEditing("new")} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
-          + Add candidate
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <select value={jobId} onChange={(e) => { setJobId(e.target.value); setFilters((f) => ({ ...f, page: 1 })); }} aria-label="Filter everything by job" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm">
+            <option value="">All jobs</option>
+            {jobs.map((j) => <option key={j.id} value={j.id}>{j.title}{j.status === "Closed" ? " (closed)" : ""}</option>)}
+          </select>
+          <button onClick={() => setEditing("new")} className={btnPrimary}>+ Add candidate <kbd className="ml-1 hidden rounded bg-indigo-500 px-1 text-xs sm:inline">n</kbd></button>
+        </div>
       </header>
 
-      <nav className="mb-6 flex gap-1 border-b border-slate-200" aria-label="Views">
-        {(["dashboard", "pipeline", "candidates"] as Tab[]).map((t) => (
-          <button key={t} onClick={() => setTab(t)} aria-current={tab === t}
-            className={`-mb-px border-b-2 px-4 py-2 text-sm font-medium capitalize ${tab === t ? "border-indigo-600 text-indigo-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
-            {t}
+      <nav className="mb-6 flex gap-1 overflow-x-auto border-b border-slate-200" aria-label="Views">
+        {TABS.map((t, i) => (
+          <button key={t} onClick={() => setTab(t)} aria-current={tab === t ? "page" : undefined}
+            className={`-mb-px whitespace-nowrap border-b-2 px-4 py-2 text-sm font-medium capitalize ${tab === t ? "border-indigo-600 text-indigo-700" : "border-transparent text-slate-500 hover:text-slate-800"}`}>
+            {t}<span className="ml-1 hidden text-xs text-slate-300 sm:inline">{i + 1}</span>
           </button>
         ))}
       </nav>
 
-      {loading ? <p className="text-slate-500">Loading...</p> : (
+      {loadError && (
+        <p role="alert" className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+          Could not reach the server. <button onClick={refresh} className="font-medium underline">Retry</button>
+        </p>
+      )}
+
+      {!loaded ? (
+        <div className="space-y-4"><div className="grid grid-cols-2 gap-3 md:grid-cols-6">{[0, 1, 2, 3, 4, 5].map((i) => <Skeleton key={i} className="h-24" />)}</div><Skeleton className="h-64" /></div>
+      ) : (
         <>
-          {tab === "dashboard" && metrics && <Dashboard m={metrics} />}
-          {tab === "pipeline" && <Pipeline all={all} onMove={move} onOpen={setDetail} />}
+          {tab === "dashboard" && metrics && <Dashboard m={metrics} onOpen={setDetailId} onShowStale={showStale} onShowInterviews={showInterviews} />}
+          {tab === "pipeline" && <Pipeline all={board} onMove={move} onOpen={(c) => setDetailId(c.id)} />}
           {tab === "candidates" && (
-            <section>
-              <div className="mb-4 flex flex-wrap gap-2">
-                <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search name, email, role, skill, notes"
-                  aria-label="Search candidates" className="min-w-64 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-                <select value={stage} onChange={(e) => setStage(e.target.value)} aria-label="Filter by stage" className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
-                  <option value="">All stages</option>{STAGES.map((s) => <option key={s}>{s}</option>)}
-                </select>
-                <select value={role} onChange={(e) => setRole(e.target.value)} aria-label="Filter by role" className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
-                  <option value="">All roles</option>{roles.map((r) => <option key={r}>{r}</option>)}
-                </select>
-                <select value={sort} onChange={(e) => setSort(e.target.value)} aria-label="Sort" className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
-                  <option value="newest">Newest</option><option value="oldest">Oldest</option>
-                  <option value="name">Name</option><option value="experience">Experience</option>
-                </select>
-              </div>
-              <p className="mb-2 text-sm text-slate-500">{shown.length} of {all.length} candidates</p>
-              <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white">
-                <table className="w-full text-left text-sm">
-                  <thead className="bg-slate-50 text-xs uppercase text-slate-500">
-                    <tr><th className="px-4 py-3">Name</th><th className="px-4 py-3">Role</th><th className="px-4 py-3">Skills</th>
-                      <th className="px-4 py-3">Exp</th><th className="px-4 py-3">Stage</th><th className="px-4 py-3">Applied</th></tr>
-                  </thead>
-                  <tbody>
-                    {shown.map((c) => (
-                      <tr key={c.id} onClick={() => setDetail(c)} className="cursor-pointer border-t border-slate-100 hover:bg-slate-50">
-                        <td className="px-4 py-3"><div className="font-medium">{c.name}</div><div className="text-xs text-slate-500">{c.email}</div></td>
-                        <td className="px-4 py-3">{c.role}</td>
-                        <td className="px-4 py-3"><div className="flex flex-wrap gap-1">{c.skills.slice(0, 3).map((s) => <span key={s} className="rounded bg-slate-100 px-1.5 py-0.5 text-xs">{s}</span>)}</div></td>
-                        <td className="px-4 py-3">{c.experience_years} yr</td>
-                        <td className="px-4 py-3"><StageBadge stage={c.stage} /></td>
-                        <td className="px-4 py-3 text-slate-500">{fmt(c.created_at)}</td>
-                      </tr>
-                    ))}
-                    {!shown.length && <tr><td colSpan={6} className="px-4 py-10 text-center text-slate-500">No candidates match these filters.</td></tr>}
-                  </tbody>
-                </table>
-              </div>
-            </section>
+            <CandidatesTable jobId={jobId} filters={filters} setFilters={setFilters} version={version} searchRef={searchRef}
+              onOpen={(c) => setDetailId(c.id)} onChanged={(m) => { flash(m); refresh(); }} onImport={() => setImporting(true)} />
           )}
+          {tab === "jobs" && <Jobs jobs={jobs} onChanged={(m) => { flash(m); refresh(); }} onViewCandidates={(id) => { setJobId(String(id)); setFilters(EMPTY_FILTERS); setTab("candidates"); }} />}
         </>
       )}
 
-      {detail && <Detail c={detail} onClose={() => setDetail(null)} onMove={move} onEdit={() => { setEditing(detail); setDetail(null); }} onDelete={() => remove(detail)} />}
-      {editing && <Form initial={editing === "new" ? null : editing} onClose={() => setEditing(null)}
-        onSaved={(m) => { setEditing(null); flash(m); refresh(); }} />}
-      {toast && <div role="status" className="fixed bottom-5 left-1/2 -translate-x-1/2 rounded-lg bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">{toast}</div>}
+      {detailId !== null && (
+        <Detail id={detailId} version={version} onClose={() => setDetailId(null)}
+          onMove={(c, to) => move(c, to, { immediate: true })}
+          onEdit={(c) => { setEditing(c); setDetailId(null); }} onDelete={remove}
+          onChanged={(m) => { if (m) flash(m); refresh(); }} />
+      )}
+      {editing && (
+        <CandidateForm initial={editing === "new" ? null : editing} jobs={jobs} defaultJobId={jobId} onClose={() => setEditing(null)}
+          onSaved={(m) => { setEditing(null); flash(m); refresh(); }} />
+      )}
+      {importing && <ImportDialog onClose={() => setImporting(false)} onDone={(m) => { setImporting(false); flash(m); refresh(); }} />}
+
+      {toast && (
+        <div role="status" className="fixed bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-4 rounded-lg bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">
+          <span>{toast.msg}</span>
+          {toast.undo && <button onClick={toast.undo} className="font-semibold text-indigo-300 hover:text-indigo-200">Undo</button>}
+        </div>
+      )}
     </div>
-  );
-}
-
-function Stat({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4">
-      <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
-      <div className="mt-1 text-3xl font-bold">{value}</div>
-      {hint && <div className="mt-1 text-xs text-slate-500">{hint}</div>}
-    </div>
-  );
-}
-
-function Bars({ rows }: { rows: { label: string; n: number }[] }) {
-  const max = Math.max(1, ...rows.map((r) => r.n));
-  return (
-    <ul className="space-y-2">
-      {rows.map((r) => (
-        <li key={r.label} className="flex items-center gap-3 text-sm">
-          <span className="w-28 shrink-0 truncate text-slate-600">{r.label}</span>
-          <div className="h-3 flex-1 rounded bg-slate-100"><div className="h-3 rounded bg-indigo-500" style={{ width: `${(r.n / max) * 100}%` }} /></div>
-          <span className="w-8 text-right font-medium">{r.n}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function Dashboard({ m }: { m: Metrics }) {
-  const first = m.funnel[0]?.reached || 0;
-  return (
-    <section className="space-y-6">
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <Stat label="Total candidates" value={m.total} />
-        <Stat label="Active in pipeline" value={m.active} />
-        <Stat label="New this week" value={m.newThisWeek} />
-        <Stat label="Hire rate" value={m.hireRate === null ? "n/a" : `${m.hireRate}%`} hint="hired / (hired + rejected)" />
-        <Stat label="Avg experience" value={`${m.avgExperience} yr`} />
-      </div>
-      <div className="grid gap-6 md:grid-cols-2">
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          <h2 className="mb-4 font-semibold">Candidates by stage</h2>
-          <Bars rows={STAGES.map((s) => ({ label: s, n: m.byStage[s] ?? 0 }))} />
-        </div>
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          <h2 className="mb-1 font-semibold">Funnel</h2>
-          <p className="mb-4 text-xs text-slate-500">Candidates who ever reached each stage, and % of all applicants.</p>
-          <Bars rows={m.funnel.map((f) => ({ label: `${f.stage} (${first ? Math.round((f.reached / first) * 100) : 0}%)`, n: f.reached }))} />
-        </div>
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          <h2 className="mb-4 font-semibold">By source</h2>
-          <Bars rows={m.bySource.map((s) => ({ label: s.source, n: s.n }))} />
-        </div>
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          <h2 className="mb-4 font-semibold">By role</h2>
-          <Bars rows={m.byRole.map((s) => ({ label: s.role, n: s.n }))} />
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function Pipeline({ all, onMove, onOpen }: { all: Candidate[]; onMove: (c: Candidate, to: Stage) => void; onOpen: (c: Candidate) => void }) {
-  const [over, setOver] = useState<Stage | null>(null);
-  return (
-    <section className="grid gap-3 overflow-x-auto md:grid-cols-6" style={{ gridAutoFlow: "column", gridAutoColumns: "minmax(220px, 1fr)" }}>
-      {STAGES.map((s) => {
-        const items = all.filter((c) => c.stage === s);
-        return (
-          <div key={s} onDragOver={(e) => { e.preventDefault(); setOver(s); }} onDragLeave={() => setOver(null)}
-            onDrop={(e) => {
-              e.preventDefault(); setOver(null);
-              const c = all.find((x) => x.id === Number(e.dataTransfer.getData("text/plain")));
-              if (c) onMove(c, s);
-            }}
-            className={`rounded-xl border bg-slate-50 p-3 ${over === s ? "border-indigo-400 bg-indigo-50" : "border-slate-200"}`}>
-            <div className="mb-3 flex items-center justify-between"><StageBadge stage={s} /><span className="text-xs text-slate-500">{items.length}</span></div>
-            <div className="space-y-2">
-              {items.map((c) => (
-                <div key={c.id} draggable onDragStart={(e) => e.dataTransfer.setData("text/plain", String(c.id))}
-                  className="cursor-grab rounded-lg border border-slate-200 bg-white p-3 shadow-sm active:cursor-grabbing">
-                  <button onClick={() => onOpen(c)} className="text-left text-sm font-medium hover:text-indigo-700">{c.name}</button>
-                  <div className="text-xs text-slate-500">{c.role}</div>
-                  <select aria-label={`Move ${c.name}`} value="" onChange={(e) => onMove(c, e.target.value as Stage)}
-                    className="mt-2 w-full rounded border border-slate-200 px-1 py-1 text-xs">
-                    <option value="">Move to...</option>
-                    {STAGES.filter((t) => canMove(c.stage, t)).map((t) => <option key={t}>{t}</option>)}
-                  </select>
-                </div>
-              ))}
-              {!items.length && <p className="py-4 text-center text-xs text-slate-400">Drop here</p>}
-            </div>
-          </div>
-        );
-      })}
-    </section>
-  );
-}
-
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [onClose]);
-  return (
-    <div className="fixed inset-0 z-10 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div role="dialog" aria-label={title} onClick={(e) => e.stopPropagation()} className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-6 shadow-xl">
-        <div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-semibold">{title}</h2>
-          <button onClick={onClose} aria-label="Close" className="text-slate-400 hover:text-slate-700">✕</button></div>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function Detail({ c, onClose, onMove, onEdit, onDelete }: { c: Candidate; onClose: () => void; onMove: (c: Candidate, to: Stage) => void; onEdit: () => void; onDelete: () => void }) {
-  const [history, setHistory] = useState<History[]>([]);
-  useEffect(() => { api<{ history: History[] }>(`/api/candidates/${c.id}`).then((r) => setHistory(r.history)); }, [c.id, c.stage]);
-  return (
-    <Modal title={c.name} onClose={onClose}>
-      <div className="space-y-3 text-sm">
-        <div className="flex items-center gap-2"><StageBadge stage={c.stage} /><span className="text-slate-500">{c.role}</span></div>
-        <dl className="grid grid-cols-[110px_1fr] gap-y-1">
-          <dt className="text-slate-500">Email</dt><dd>{c.email}</dd>
-          <dt className="text-slate-500">Phone</dt><dd>{c.phone || "-"}</dd>
-          <dt className="text-slate-500">Experience</dt><dd>{c.experience_years} yr</dd>
-          <dt className="text-slate-500">Source</dt><dd>{c.source}</dd>
-          <dt className="text-slate-500">Skills</dt><dd>{c.skills.join(", ") || "-"}</dd>
-          <dt className="text-slate-500">Notes</dt><dd className="whitespace-pre-wrap">{c.notes || "-"}</dd>
-        </dl>
-        <div>
-          <div className="mb-1 text-xs font-semibold uppercase text-slate-500">Move to stage</div>
-          <div className="flex flex-wrap gap-2">
-            {STAGES.filter((s) => canMove(c.stage, s)).map((s) => (
-              <button key={s} onClick={() => onMove(c, s)} className={`rounded-full border px-3 py-1 text-xs font-medium ${STAGE_COLOR[s]}`}>{s}</button>
-            ))}
-            {!STAGES.some((s) => canMove(c.stage, s)) && <span className="text-slate-500">No further moves.</span>}
-          </div>
-        </div>
-        <div>
-          <div className="mb-1 text-xs font-semibold uppercase text-slate-500">History</div>
-          <ol className="space-y-1 border-l border-slate-200 pl-3">
-            {history.map((h, i) => <li key={i} className="text-xs text-slate-600">{h.from_stage ? `${h.from_stage} → ` : "Added as "}<b>{h.to_stage}</b> · {fmt(h.changed_at)}</li>)}
-          </ol>
-        </div>
-        <div className="flex justify-between pt-2">
-          <button onClick={onDelete} className="text-sm text-rose-600 hover:underline">Delete</button>
-          <button onClick={onEdit} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium hover:bg-slate-50">Edit</button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function Form({ initial, onClose, onSaved }: { initial: Candidate | null; onClose: () => void; onSaved: (msg: string) => void }) {
-  const [f, setF] = useState({
-    name: initial?.name ?? "", email: initial?.email ?? "", phone: initial?.phone ?? "", role: initial?.role ?? "",
-    skills: initial?.skills.join(", ") ?? "", experience_years: String(initial?.experience_years ?? 0),
-    source: initial?.source ?? "Direct", notes: initial?.notes ?? "", stage: (initial?.stage ?? "Applied") as Stage,
-  });
-  const [errors, setErrors] = useState<Record<string, string[]>>({});
-  const [busy, setBusy] = useState(false);
-  const set = (k: string, v: string) => setF((p) => ({ ...p, [k]: v }));
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault(); setBusy(true); setErrors({});
-    const body = { ...f, skills: parseSkills(f.skills), experience_years: Number(f.experience_years) };
-    if (initial) delete (body as Partial<typeof body>).stage; // stage changes go through the move flow so history stays correct
-    try {
-      await api(initial ? `/api/candidates/${initial.id}` : "/api/candidates", { method: initial ? "PATCH" : "POST", body: JSON.stringify(body) });
-      onSaved(initial ? "Candidate updated" : "Candidate added");
-    } catch (err) {
-      setErrors((err as { fields?: Record<string, string[]> }).fields ?? { form: [(err as Error).message] });
-      setBusy(false);
-    }
-  }
-
-  const field = (k: keyof typeof f, label: string, type = "text") => (
-    <label className="block text-sm">
-      <span className="text-slate-600">{label}</span>
-      <input type={type} value={f[k]} onChange={(e) => set(k, e.target.value)} step={type === "number" ? "0.5" : undefined}
-        className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" />
-      {errors[k] && <span className="text-xs text-rose-600">{errors[k][0]}</span>}
-    </label>
-  );
-
-  return (
-    <Modal title={initial ? "Edit candidate" : "Add candidate"} onClose={onClose}>
-      <form onSubmit={submit} className="space-y-3" noValidate>
-        {errors.form && <p className="rounded bg-rose-50 p-2 text-sm text-rose-700">{errors.form[0]}</p>}
-        <div className="grid gap-3 sm:grid-cols-2">{field("name", "Full name")}{field("email", "Email", "email")}</div>
-        <div className="grid gap-3 sm:grid-cols-2">{field("phone", "Phone")}{field("role", "Role applied for")}</div>
-        {field("skills", "Skills (comma separated)")}
-        <div className="grid gap-3 sm:grid-cols-2">{field("experience_years", "Experience (years)", "number")}
-          <label className="block text-sm"><span className="text-slate-600">Source</span>
-            <select value={f.source} onChange={(e) => set("source", e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2">
-              {["Direct", "LinkedIn", "Referral", "Job Board", "Campus", "Other"].map((s) => <option key={s}>{s}</option>)}
-            </select></label></div>
-        {!initial && (
-          <label className="block text-sm"><span className="text-slate-600">Starting stage</span>
-            <select value={f.stage} onChange={(e) => set("stage", e.target.value)} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2">
-              {STAGES.map((s) => <option key={s}>{s}</option>)}</select></label>
-        )}
-        <label className="block text-sm"><span className="text-slate-600">Notes</span>
-          <textarea value={f.notes} onChange={(e) => set("notes", e.target.value)} rows={3} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" /></label>
-        <div className="flex justify-end gap-2 pt-2">
-          <button type="button" onClick={onClose} className="rounded-lg px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">Cancel</button>
-          <button disabled={busy} className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">{busy ? "Saving..." : "Save"}</button>
-        </div>
-      </form>
-    </Modal>
   );
 }

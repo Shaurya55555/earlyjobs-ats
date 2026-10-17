@@ -19,13 +19,13 @@ describe("canMove", () => {
 
 describe("candidateInput", () => {
   it("normalises email and applies defaults", () => {
-    const r = candidateInput.parse({ name: " A ", email: " A@B.com ", role: "Dev" });
+    const r = candidateInput.parse({ name: " A ", email: " A@B.com ", job_id: 1 });
     expect(r.email).toBe("a@b.com");
     expect(r.stage).toBe("Applied");
     expect(r.skills).toEqual([]);
   });
   it("rejects bad email and missing name", () => {
-    const r = candidateInput.safeParse({ name: "", email: "nope", role: "Dev" });
+    const r = candidateInput.safeParse({ name: "", email: "nope", job_id: 1 });
     expect(r.success).toBe(false);
   });
 });
@@ -35,3 +35,4 @@ describe("parseSkills", () => {
     expect(parseSkills("React, Node ,React,,")).toEqual(["React", "Node"]);
   });
 });
+
