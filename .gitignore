@@ -46,3 +46,8 @@ next-env.d.ts
 
 # demo video and script
 demo/
+
+# agent tooling added by the Vercel integration
+.agents/
+.claude/
+skills-lock.json
