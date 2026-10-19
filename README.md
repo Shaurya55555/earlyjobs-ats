@@ -4,7 +4,7 @@ An applicant tracking system for small hiring teams: job openings, candidates, a
 
 - Live app: https://earlyjobs-ats-five.vercel.app
 - Repository: https://github.com/Shaurya55555/earlyjobs-ats
-- Demo video: REPLACE-ME
+- Demo video: https://youtu.be/TKPqtlwKGHM
 
 ## Features
 
