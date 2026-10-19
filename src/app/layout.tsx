@@ -17,7 +17,7 @@ export const metadata: Metadata = {
   description: "Applicant tracking: candidates, hiring stages, search and dashboard metrics",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html
       lang="en"
