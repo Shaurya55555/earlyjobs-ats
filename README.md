@@ -49,7 +49,7 @@ The data layer picks its database from the environment: with `DATABASE_URL` it u
 ```bash
 npm install --legacy-peer-deps
 npm run dev        # http://localhost:3000
-npm test           # 24 tests: stage rules, validation, CSV, and the full API against a real Postgres
+npm test           # 25 tests: stage rules, validation, CSV, and the full API against a real Postgres
 ```
 
 To use your own database: `DATABASE_URL=postgres://... npm run dev`.

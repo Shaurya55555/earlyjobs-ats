@@ -41,7 +41,20 @@ export const candidateInput = z.object({
   interview_type: z.enum(INTERVIEW_TYPES).default(""),
   stage: z.enum(STAGES).default("Applied"),
 });
-export const candidatePatch = candidateInput.partial();
+// A patch only changes what it names. Zod keeps defaults through .partial(), which would
+// reset omitted fields (skills, rating, phone...) to their defaults, so strip them first.
+const shape = candidateInput.shape;
+export const candidatePatch = z.object({
+  ...shape,
+  phone: shape.phone.removeDefault(),
+  skills: shape.skills.removeDefault(),
+  experience_years: shape.experience_years.removeDefault(),
+  source: shape.source.removeDefault(),
+  rating: shape.rating.removeDefault(),
+  interview_at: shape.interview_at.removeDefault(),
+  interview_type: shape.interview_type.removeDefault(),
+  stage: shape.stage.removeDefault(),
+}).partial();
 
 export const jobInput = z.object({
   title: z.string().trim().min(1, "Title is required").max(100),

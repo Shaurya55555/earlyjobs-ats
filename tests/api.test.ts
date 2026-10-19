@@ -70,6 +70,15 @@ describe("candidates API", () => {
     expect(detail.body.history.map((h: { to_stage: string }) => h.to_stage)).toEqual(["Applied", "Interview", "Hired"]);
   });
 
+  it("a partial update leaves every other field untouched", async () => {
+    const job = await firstJobId();
+    const created = (await get(await list.POST(new Request(U, json({ name: "Keep", email: "keep@example.com", job_id: job, skills: ["Go", "SQL"], rating: 4, experience_years: 3, phone: "123", source: "Referral" }))))).body.candidate;
+    await one.PATCH(new Request(U, json({ stage: "Screening" }, "PATCH")), ctx(created.id));
+    await one.PATCH(new Request(U, json({ rating: 5 }, "PATCH")), ctx(created.id));
+    const after = (await get(await one.GET(new Request(U), ctx(created.id)))).body.candidate;
+    expect(after).toMatchObject({ stage: "Screening", rating: 5, skills: ["Go", "SQL"], experience_years: 3, phone: "123", source: "Referral" });
+  });
+
   it("adds notes and counts them", async () => {
     const job = await firstJobId();
     const c = (await get(await list.POST(new Request(U, json({ name: "Noted", email: "noted@example.com", job_id: job }))))).body.candidate;
