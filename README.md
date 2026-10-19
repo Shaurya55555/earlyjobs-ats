@@ -2,7 +2,7 @@
 
 An applicant tracking system for small hiring teams: job openings, candidates, a drag and drop hiring pipeline, search, notes, interview scheduling, CSV import and export, and a metrics dashboard. Built for the EarlyJobs.ai Full Stack Developer Intern assignment.
 
-- Live app: https://REPLACE-ME.vercel.app
+- Live app: https://earlyjobs-ats-five.vercel.app
 - Repository: https://github.com/Shaurya55555/earlyjobs-ats
 - Demo video: REPLACE-ME
 
